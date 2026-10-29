@@ -163,56 +163,80 @@ const DEMO = {
 const STALE_SUMMARY = 'REQ-01 Bolus dose shall never exceed the configured maximum bolus or 25 U, whichever is lower';
 const codeOf = (summary) => String(summary).split(' ')[0]; // "REQ-01", "HAZ-03", "TC-07"
 
-// Idempotent: creates only the demo issues, links and transitions that are missing, so it can be
-// re-run safely (e.g. after a timeout, or by a judge clicking twice).
-export async function seedDemo(projectKey) {
-  const existing = await fetchTraceIssues(projectKey);
-  const demoCodes = new Set([...DEMO.reqs, ...DEMO.risks, ...DEMO.tests].map(([s]) => codeOf(s)));
-  const byCode = new Map(existing.map((i) => [codeOf(i.fields.summary), i]));
-  if (existing.some((i) => !demoCodes.has(codeOf(i.fields.summary)))) {
-    return { created: 0, message: `Project ${projectKey} already has its own trace issues; demo data was not added. Use an empty project for the demo.` };
+// Run `fn` over `items` with at most `size` requests in flight (fast, but polite to rate limits).
+async function pool(items, size, fn) {
+  const out = [];
+  let next = 0;
+  const worker = async () => { while (next < items.length) { const i = next++; out[i] = await fn(items[i], i); } };
+  await Promise.all(Array.from({ length: Math.min(size, items.length) }, worker));
+  return out;
+}
+
+// Current fields of a known set of issues, read directly (not via search, which is eventually
+// consistent and may not see issues created a moment ago).
+const readIssues = (keys, fields) => pool(keys, 6, async (k) => {
+  const res = await jira().requestJira(route`/rest/api/3/issue/${k}?fields=${fields}`, { headers: { Accept: 'application/json' } });
+  return json(res, `Read ${k}`);
+});
+
+// Demo seeding runs in three short phases, each a separate call from the UI, because a Forge
+// function invocation must finish within 25 seconds. Every phase is idempotent, so a retry or a
+// double click never creates duplicates.
+//   'issues' -> creates missing demo issues, returns { keys: { "REQ-01": "MED-1", ... } }
+//   'links'  -> creates the missing trace links between them
+//   'finish' -> passes the tests that passed, then edits REQ-01 after its test passed (stale)
+export async function seedDemo(projectKey, phase = 'issues', keys) {
+  if (phase === 'issues') {
+    const existing = await fetchTraceIssues(projectKey);
+    const demoCodes = new Set([...DEMO.reqs, ...DEMO.risks, ...DEMO.tests].map(([s]) => codeOf(s)));
+    if (existing.some((i) => !demoCodes.has(codeOf(i.fields.summary)))) {
+      return { done: true, created: 0, message: `Project ${projectKey} already has its own trace issues; demo data was not added. Use an empty project for the demo.` };
+    }
+    const keyOf = Object.fromEntries(existing.map((i) => [codeOf(i.fields.summary), i.key]));
+    const missing = [
+      ...DEMO.reqs.map(([s, d]) => ({ summary: s, description: d, labels: [LABELS.req] })),
+      ...DEMO.risks.map(([s, sev]) => ({ summary: s, description: `Hazard analysed per ISO 14971. Severity: ${sev}.`, labels: [LABELS.risk, `severity-${sev}`] })),
+      ...DEMO.tests.map(([s, , r]) => ({ summary: s, description: 'Verification test (IEC 62304 §5.7).', labels: r === 'fail' ? [LABELS.test, LABELS.failed] : [LABELS.test] })),
+    ].filter((it) => !keyOf[codeOf(it.summary)]);
+    const newKeys = missing.length ? await createIssues(projectKey, missing) : [];
+    missing.forEach((it, n) => { keyOf[codeOf(it.summary)] = newKeys[n]; });
+    return { done: false, created: newKeys.length, keys: keyOf };
   }
 
-  // 1. Create whatever demo issues are missing, then resolve every code to an issue key.
-  const missing = [
-    ...DEMO.reqs.map(([s, d]) => ({ summary: s, description: d, labels: [LABELS.req] })),
-    ...DEMO.risks.map(([s, sev]) => ({ summary: s, description: `Hazard analysed per ISO 14971. Severity: ${sev}.`, labels: [LABELS.risk, `severity-${sev}`] })),
-    ...DEMO.tests.map(([s, , r]) => ({ summary: s, description: 'Verification test (IEC 62304 §5.7).', labels: r === 'fail' ? [LABELS.test, LABELS.failed] : [LABELS.test] })),
-  ].filter((it) => !byCode.has(codeOf(it.summary)));
-  const newKeys = missing.length ? await createIssues(projectKey, missing) : [];
-  const keyOf = new Map([...byCode].map(([c, i]) => [c, i.key]));
-  missing.forEach((it, n) => keyOf.set(codeOf(it.summary), newKeys[n]));
-  const req = (i) => keyOf.get(codeOf(DEMO.reqs[i][0]));
-  const risk = (i) => keyOf.get(codeOf(DEMO.risks[i][0]));
-  const tst = (i) => keyOf.get(codeOf(DEMO.tests[i][0]));
+  const k = (row) => keys[codeOf(row[0])];
+  if (!keys || Object.keys(keys).length < DEMO.reqs.length + DEMO.risks.length + DEMO.tests.length) throw new Error('Demo issues are missing; run the issues phase first.');
 
-  // 2. Links that do not exist yet (Jira reports a link on both issues; check both directions).
-  const linkedPairs = new Set();
-  for (const i of existing) for (const l of i.fields.issuelinks || []) {
-    const other = (l.outwardIssue || l.inwardIssue)?.key;
-    if (other) { linkedPairs.add(`${i.key}|${other}`); linkedPairs.add(`${other}|${i.key}`); }
+  if (phase === 'links') {
+    const issues = await readIssues(Object.values(keys), 'issuelinks');
+    const linked = new Set();
+    for (const i of issues) for (const l of i.fields.issuelinks || []) {
+      const other = (l.outwardIssue || l.inwardIssue)?.key;
+      if (other) { linked.add(`${i.key}|${other}`); linked.add(`${other}|${i.key}`); }
+    }
+    const pairs = [
+      ...DEMO.controls.flatMap(([ri, qs]) => qs.map((q) => [k(DEMO.risks[ri]), k(DEMO.reqs[q])])),
+      ...DEMO.tests.flatMap((t, ti) => t[1].map((q) => [k(DEMO.tests[ti]), k(DEMO.reqs[q])])),
+    ].filter(([a, b]) => !linked.has(`${a}|${b}`));
+    const type = await linkTypeName();
+    await pool(pairs, 5, ([a, b]) => link(type, a, b));
+    return { done: false, links: pairs.length };
   }
-  const type = await linkTypeName();
-  const pairs = [
-    ...DEMO.controls.flatMap(([ri, qs]) => qs.map((q) => [risk(ri), req(q)])),
-    ...DEMO.tests.flatMap(([, qs], ti) => qs.map((q) => [tst(ti), req(q)])),
-  ];
-  let links = 0;
-  for (const [a, b] of pairs) if (!linkedPairs.has(`${a}|${b}`)) { await link(type, a, b); links++; }
 
-  // 3. Pass the tests that passed, then change REQ-01's wording *after* its test passed (stale).
-  const doneKeys = new Set(existing.filter((i) => i.fields.status?.statusCategory?.key === 'done').map((i) => i.key));
-  for (let i = 0; i < DEMO.tests.length; i++) if (DEMO.tests[i][2] === 'pass' && !doneKeys.has(tst(i))) await transitionToDone(tst(i));
-  const staleKey = req(DEMO.staleReq);
-  if (byCode.get(codeOf(STALE_SUMMARY))?.fields.summary !== STALE_SUMMARY) {
+  // phase 'finish'
+  const passKeys = DEMO.tests.filter((t) => t[2] === 'pass').map((t) => k(t));
+  const tests = await readIssues(passKeys, 'status');
+  const todo = tests.filter((i) => i.fields.status?.statusCategory?.key !== 'done').map((i) => i.key);
+  await pool(todo, 5, transitionToDone);
+  const staleKey = k(DEMO.reqs[DEMO.staleReq]);
+  const [req] = await readIssues([staleKey], 'summary');
+  if (req.fields.summary !== STALE_SUMMARY) {
     await jira().requestJira(route`/rest/api/3/issue/${staleKey}`, {
       method: 'PUT',
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
       body: JSON.stringify({ fields: { summary: STALE_SUMMARY } }),
     }).then((r) => json(r, `Update ${staleKey}`));
   }
-
-  return { created: newKeys.length, message: `GlucoFlow demo ready in ${projectKey}: ${newKeys.length} issues created, ${links} trace links added.` };
+  return { done: true, message: `GlucoFlow demo ready in ${projectKey}: 10 requirements, 6 risks and 9 tests with realistic audit gaps.` };
 }
 
 // ---------------------------------------------------------------- fixing gaps
@@ -236,21 +260,21 @@ export async function createFixTasks(projectKey, onlyKeys) {
   const created = [];
   const skipped = [];
   const todo = [];
-  for (const g of gaps) {
+  // Duplicate check for all gaps in parallel (each is one JQL search).
+  const existing = await pool(gaps, 6, (g) => openFixTasks(g.key));
+  gaps.forEach((g, i) => {
     const summary = `[Trace] ${g.fix}: ${g.key}`;
-    if ((await openFixTasks(g.key)).includes(summary)) { skipped.push(g.key); continue; }
-    todo.push({ g, summary });
-  }
+    if (existing[i].includes(summary)) skipped.push(g.key);
+    else todo.push({ g, summary });
+  });
   if (todo.length) {
     const keys = await createIssues(projectKey, todo.map(({ g, summary }) => ({
       summary,
       labels: ['trace-fix', `trace-gap-${g.rule.toLowerCase()}`],
       description: `Audit gap found by Trace on ${g.key} "${g.summary}".\nRule: ${g.title} (${g.severity}).\n${g.detail}\nWhy it matters: auditors expect every requirement verified and every risk controlled (IEC 62304, ISO 14971).`,
     })));
-    for (let i = 0; i < keys.length; i++) {
-      await link(type, keys[i], todo[i].g.key);
-      created.push({ task: keys[i], for: todo[i].g.key, rule: todo[i].g.title });
-    }
+    await pool(keys, 5, (key, i) => link(type, key, todo[i].g.key));
+    keys.forEach((key, i) => created.push({ task: key, for: todo[i].g.key, rule: todo[i].g.title }));
   }
   return { created, skipped };
 }
@@ -287,6 +311,10 @@ async function confluenceSpace(spaceKey) {
   const res = spaceKey
     ? await conf.requestConfluence(route`/wiki/api/v2/spaces?keys=${spaceKey}`, { headers: { Accept: 'application/json' } })
     : await conf.requestConfluence(route`/wiki/api/v2/spaces?type=global&limit=25`, { headers: { Accept: 'application/json' } });
+  // 401/403 here almost always means Trace is installed in Jira but not yet in Confluence.
+  if (res.status === 401 || res.status === 403) {
+    throw new Error('Trace is not installed in Confluence on this site yet. Open the Trace installation link again, choose Confluence and install, then retry.');
+  }
   const spaces = (await json(res, 'Read Confluence spaces')).results || [];
   if (!spaces.length) throw new Error(spaceKey ? `Confluence space ${spaceKey} not found` : 'No Confluence space found. Create one first.');
   return spaces[0];

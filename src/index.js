@@ -24,7 +24,8 @@ resolver.define('getReport', async ({ payload, context }) => {
   return { projectKey, siteUrl: context.siteUrl, report: await report(projectKey) };
 });
 
-resolver.define('seedDemo', async ({ payload, context }) => seedDemo(await contextProject(context, payload)));
+// Called once per phase by the UI ('issues' -> 'links' -> 'finish'); see seedDemo.
+resolver.define('seedDemo', async ({ payload, context }) => seedDemo(await contextProject(context, payload), payload?.phase, payload?.keys));
 
 resolver.define('createFixTasks', async ({ payload, context }) => createFixTasks(await contextProject(context, payload), payload?.keys));
 

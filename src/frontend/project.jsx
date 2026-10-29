@@ -49,9 +49,13 @@ const App = () => {
     }
   };
 
+  // The demo is loaded in three short backend calls (Forge functions must finish within 25 s).
   const seed = () => run('seed', async () => {
-    const r = await invoke('seedDemo');
-    return { appearance: 'success', title: 'Demo project loaded', body: r.message };
+    const first = await invoke('seedDemo', { phase: 'issues' });
+    if (first.done) return { appearance: 'warning', title: 'Demo not loaded', body: first.message };
+    await invoke('seedDemo', { phase: 'links', keys: first.keys });
+    const last = await invoke('seedDemo', { phase: 'finish', keys: first.keys });
+    return { appearance: 'success', title: 'Demo project loaded', body: last.message };
   });
   const fixAll = () => run('fix', async () => {
     const r = await invoke('createFixTasks');
