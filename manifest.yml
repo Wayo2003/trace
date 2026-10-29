@@ -1,0 +1,164 @@
+modules:
+  # ---------------------------------------------------------------- Rovo agent
+  rovo:agent:
+    - key: trace-auditor
+      name: Trace Auditor
+      description: Audit-readiness agent for regulated software teams (IEC 62304, ISO 14971, FDA design controls). Finds traceability gaps between requirements, risks and tests in Jira and fixes them.
+      prompt: >
+        You are Trace Auditor, a meticulous but friendly quality and regulatory expert for
+        medical-device and other regulated software teams. You help them prove, from the
+        Jira work they already do, that every requirement is verified and every risk is
+        controlled, the way an IEC 62304 / ISO 14971 / FDA design-controls auditor would check.
+
+
+        Data model: requirements are Jira issues labelled trace-req, risks are labelled
+        trace-risk (with severity-high, severity-medium or severity-low), verification tests
+        are labelled trace-test (Done = passed, label test-failed = failed). Any issue link
+        between them is a trace link.
+
+
+        How to work:
+
+        1. To judge readiness, ALWAYS call the audit-readiness action first; never guess.
+        If the user did not name a project and you are not in an issue, ask for the project key.
+
+        2. Lead with the verdict (score and READY / NOT READY), then the blocking (high)
+        gaps, grouped and explained in plain language: why an auditor would flag it and the
+        concrete fix. Mention issue keys so people can click them.
+
+        3. For impact questions ("what breaks if we change X", "what does this test cover"),
+        call trace-issue and explain the affected risks and the tests that must be re-run.
+
+        4. Only create Jira tasks or Confluence pages when the user asks or agrees. Use
+        create-gap-tasks for tasks (it never duplicates) and generate-dhf for the
+        Design History File traceability page, then share the result and link.
+
+        5. Be precise and concise. Never invent issues, tests or results that the actions did
+        not return. You are not a substitute for the manufacturer's quality system; say so if
+        asked for legal or certification advice.
+      conversationStarters:
+        - Is this project ready for an audit?
+        - What are the blocking gaps and how do we fix them?
+        - What breaks if we change this requirement?
+        - Write the traceability matrix page for our Design History File
+      actions:
+        - audit-readiness
+        - trace-issue
+        - create-gap-tasks
+        - generate-dhf
+
+  action:
+    - key: audit-readiness
+      name: Check audit readiness
+      function: auditReadinessFn
+      actionVerb: GET
+      description: >
+        Analyses all requirements, risks and tests of a Jira project and returns the audit
+        readiness score, counts, and every traceability gap with its severity and required fix.
+      inputs:
+        projectKey:
+          title: Project key
+          type: string
+          required: false
+          description: The Jira project key, e.g. MED. Optional if the chat is opened from an issue.
+    - key: trace-issue
+      name: Trace one issue
+      function: traceIssueFn
+      actionVerb: GET
+      description: >
+        Impact analysis for one requirement, risk or test: returns its verification state,
+        the risks it controls and the tests that verify it (or what a test verifies).
+      inputs:
+        issueKey:
+          title: Issue key
+          type: string
+          required: false
+          description: The Jira issue key, e.g. MED-4. Optional if the chat is opened from that issue.
+    - key: create-gap-tasks
+      name: Create tasks for gaps
+      function: createGapTasksFn
+      actionVerb: CREATE
+      description: >
+        Creates one Jira task per traceability gap, linked to the affected requirement, risk
+        or test. Skips gaps that already have an open fix task.
+      inputs:
+        projectKey:
+          title: Project key
+          type: string
+          required: false
+          description: The Jira project key, e.g. MED.
+        issueKeys:
+          title: Only these issues
+          type: string
+          required: false
+          description: Optional comma-separated issue keys to limit the tasks to, e.g. "MED-1, MED-14".
+    - key: generate-dhf
+      name: Publish DHF traceability page
+      function: generateDhfFn
+      actionVerb: CREATE
+      description: >
+        Publishes a Confluence page with the full traceability matrix, risk control table and
+        open gaps, ready for a design review or the Design History File.
+      inputs:
+        projectKey:
+          title: Project key
+          type: string
+          required: false
+          description: The Jira project key, e.g. MED.
+        spaceKey:
+          title: Confluence space key
+          type: string
+          required: false
+          description: Optional Confluence space key; defaults to the first global space.
+
+  # ---------------------------------------------------------------- Jira UI
+  jira:projectPage:
+    - key: trace-project-page
+      title: Trace
+      resource: project-page
+      resolver:
+        function: resolver
+      render: native
+
+  jira:issueContext:
+    - key: trace-issue-context
+      title: Trace
+      label: Traceability
+      resource: issue-context
+      resolver:
+        function: resolver
+      render: native
+
+  # ---------------------------------------------------------------- functions
+  function:
+    - key: resolver
+      handler: index.handler
+    - key: auditReadinessFn
+      handler: index.auditReadiness
+    - key: traceIssueFn
+      handler: index.traceIssue
+    - key: createGapTasksFn
+      handler: index.createGapTasks
+    - key: generateDhfFn
+      handler: index.generateDhf
+
+resources:
+  - key: project-page
+    path: src/frontend/project.jsx
+  - key: issue-context
+    path: src/frontend/issue.jsx
+
+permissions:
+  scopes:
+    - read:jira-work
+    - write:jira-work
+    - read:space:confluence
+    - read:page:confluence
+    - write:page:confluence
+
+app:
+  runtime:
+    name: nodejs24.x
+    memoryMB: 256
+    architecture: arm64
+  id: ari:cloud:ecosystem::app/e48d851a-2e5b-4eb9-945d-348f7f533ec7
